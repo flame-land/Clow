@@ -226,7 +226,7 @@ channel_group = app_commands.Group(
 @app_commands.checks.has_permissions(administrator=True)
 async def channel_exempt(
     interaction: discord.Interaction,
-    channel: discord.abc.GuildChannel,
+    channel: discord.TextChannel,
 ):
     if channel.guild.id != interaction.guild_id:
         await interaction.response.send_message(
@@ -274,7 +274,7 @@ async def channel_exempt(
 @app_commands.checks.has_permissions(administrator=True)
 async def channel_unexempt(
     interaction: discord.Interaction,
-    channel: discord.abc.GuildChannel,
+    channel: discord.TextChannel,
 ):
     guild_state = get_guild_state(interaction.guild)
     exempt_ids = {int(value) for value in guild_state.get("exempt_channel_ids", [])}
