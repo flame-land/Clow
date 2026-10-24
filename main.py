@@ -39,9 +39,13 @@ def get_guild_state(guild):
             "active": False,
             "channels": {},
             "exempt_role_ids": sorted(EXEMPT_ROLE_IDS),
+            "exempt_channel_ids": [],
         }
-    elif "exempt_role_ids" not in state[key]:
-        state[key]["exempt_role_ids"] = sorted(EXEMPT_ROLE_IDS)
+    else:
+        if "exempt_role_ids" not in state[key]:
+            state[key]["exempt_role_ids"] = sorted(EXEMPT_ROLE_IDS)
+        if "exempt_channel_ids" not in state[key]:
+            state[key]["exempt_channel_ids"] = []
     return state[key]
 
 
@@ -138,6 +142,10 @@ async def lock_channel(channel):
     }
     channel_id = str(channel.id)
 
+    # Exempted channels remain open to everyone and are not locked.
+    if channel.id in {int(value) for value in guild_state.get("exempt_channel_ids", [])}:
+        return
+
     # Save the original overwrites only once, before changing them.
     if channel_id not in guild_state["channels"]:
         guild_state["channels"][channel_id] = serialize_overwrites(channel)
@@ -202,6 +210,100 @@ async def on_guild_channel_create(channel):
         await lock_channel(channel)
     except (discord.Forbidden, discord.HTTPException) as exc:
         print(f"Could not lock new channel {channel.id}: {exc}")
+
+
+channel_group = app_commands.Group(
+    name="channel",
+    description="Manage channels excluded from maintenance lockdown.",
+)
+
+
+@channel_group.command(
+    name="exempt",
+    description="Keep one channel visible to everyone during maintenance.",
+)
+@app_commands.describe(channel="The channel to exclude from maintenance lockdown.")
+@app_commands.checks.has_permissions(administrator=True)
+async def channel_exempt(
+    interaction: discord.Interaction,
+    channel: discord.abc.GuildChannel,
+):
+    if channel.guild.id != interaction.guild_id:
+        await interaction.response.send_message(
+            "Choose a channel from this server.", ephemeral=True
+        )
+        return
+
+    guild_state = get_guild_state(interaction.guild)
+    exempt_ids = {int(value) for value in guild_state.get("exempt_channel_ids", [])}
+    if channel.id in exempt_ids:
+        await interaction.response.send_message(
+            f"{channel.mention if hasattr(channel, 'mention') else channel.name} is already exempt.",
+            ephemeral=True,
+        )
+        return
+
+    # If already locked, restore this channel's saved overwrites before exempting it.
+    saved = guild_state.get("channels", {}).get(str(channel.id))
+    if guild_state["active"] and saved is not None:
+        try:
+            await restore_overwrites(interaction.guild, channel, saved)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(f"Could not restore exempt channel {channel.id}: {exc}")
+            await interaction.response.send_message(
+                "I couldn't restore this channel's permissions. Check Manage Channels.",
+                ephemeral=True,
+            )
+            return
+        guild_state["channels"].pop(str(channel.id), None)
+
+    exempt_ids.add(channel.id)
+    guild_state["exempt_channel_ids"] = sorted(exempt_ids)
+    save_state(state)
+    await interaction.response.send_message(
+        f"{channel.name} is now exempt from maintenance. Everyone's existing channel access is preserved.",
+        ephemeral=True,
+    )
+
+
+@channel_group.command(
+    name="unexempt",
+    description="Remove a channel's maintenance exemption.",
+)
+@app_commands.describe(channel="The channel to include in maintenance lockdown again.")
+@app_commands.checks.has_permissions(administrator=True)
+async def channel_unexempt(
+    interaction: discord.Interaction,
+    channel: discord.abc.GuildChannel,
+):
+    guild_state = get_guild_state(interaction.guild)
+    exempt_ids = {int(value) for value in guild_state.get("exempt_channel_ids", [])}
+    if channel.id not in exempt_ids:
+        await interaction.response.send_message(
+            f"{channel.name} is not exempt.", ephemeral=True
+        )
+        return
+
+    exempt_ids.remove(channel.id)
+    guild_state["exempt_channel_ids"] = sorted(exempt_ids)
+    save_state(state)
+
+    if guild_state["active"]:
+        failed = await apply_lock_to_guild(interaction.guild)
+        if channel.name in failed:
+            await interaction.response.send_message(
+                "Exemption removed, but I couldn't lock this channel. Check Manage Channels.",
+                ephemeral=True,
+            )
+            return
+
+    await interaction.response.send_message(
+        f"{channel.name} is no longer exempt from maintenance.",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(channel_group)
 
 
 @bot.tree.command(name="on", description="Enable maintenance with exempt roles.")
