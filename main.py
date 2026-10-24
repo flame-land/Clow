@@ -31,6 +31,20 @@ def save_state(state):
     temporary.replace(STATE_FILE)
 
 
+def get_guild_state(guild):
+    key = str(guild.id)
+    if key not in state:
+        state[key] = {
+            "active": False,
+            "channels": {},
+            "exempt_role_ids": sorted(EXEMPT_ROLE_IDS),
+        }
+    elif "exempt_role_ids" not in state[key]:
+        # Migrate state files created before per-server exempt roles existed.
+        state[key]["exempt_role_ids"] = sorted(EXEMPT_ROLE_IDS)
+    return state[key]
+
+
 def overwrite_to_data(overwrite):
     allow, deny = overwrite.pair()
     return {"allow": allow.value, "deny": deny.value}
@@ -84,7 +98,8 @@ state = load_state()
 
 async def lock_channel(channel):
     guild = channel.guild
-    guild_state = state.setdefault(str(guild.id), {"active": False, "channels": {}})
+    guild_state = get_guild_state(guild)
+    exempt_role_ids = {int(role_id) for role_id in guild_state["exempt_role_ids"]}
     channel_id = str(channel.id)
 
     # Save the pre-lock state once, so /start can restore it.
@@ -98,17 +113,15 @@ async def lock_channel(channel):
     everyone_overwrite.view_channel = False
     overwrites[everyone] = everyone_overwrite
 
-    # Prevent ordinary role overwrites from bypassing the @everyone deny.
-    # Only configured exempt roles receive an explicit view permission.
+    # Ordinary roles are denied; configured exempt roles are allowed.
     for role in guild.roles:
         if role == everyone:
             continue
         role_overwrite = overwrites.get(role, discord.PermissionOverwrite())
-        role_overwrite.view_channel = role.id in EXEMPT_ROLE_IDS
+        role_overwrite.view_channel = role.id in exempt_role_ids
         overwrites[role] = role_overwrite
 
-    # Member-specific allows can override role-level denies, so neutralize
-    # those view overwrites during maintenance. Exempt roles still get access.
+    # Remove member-specific view overrides that could bypass role-level rules.
     for target, member_overwrite in list(overwrites.items()):
         if isinstance(target, discord.Member):
             member_overwrite.view_channel = None
@@ -150,7 +163,7 @@ async def on_guild_channel_create(channel):
 @app_commands.guild_only()
 async def maintenance_on(interaction: discord.Interaction):
     guild = interaction.guild
-    guild_state = state.setdefault(str(guild.id), {"active": False, "channels": {}})
+    guild_state = get_guild_state(guild)
     if guild_state["active"]:
         await interaction.response.send_message(
             "Maintenance mode is already on.", ephemeral=True
@@ -181,7 +194,6 @@ async def maintenance_start(interaction: discord.Interaction):
         )
         return
 
-    # Disable first so channels created during restoration are not locked again.
     guild_state["active"] = False
     save_state(state)
     await interaction.response.send_message(
@@ -213,6 +225,81 @@ async def maintenance_start(interaction: discord.Interaction):
             "Maintenance ended. Saved channel permissions have been restored.",
             ephemeral=True,
         )
+
+
+exempt_group = app_commands.Group(
+    name="exempt",
+    description="Manage roles that can view channels during maintenance.",
+)
+
+
+@exempt_group.command(name="add", description="Allow a role to view channels during maintenance.")
+@app_commands.describe(role="The role to exempt from maintenance lockdown.")
+@app_commands.checks.has_permissions(administrator=True)
+async def exempt_add(interaction: discord.Interaction, role: discord.Role):
+    guild_state = get_guild_state(interaction.guild)
+    role_ids = {int(role_id) for role_id in guild_state["exempt_role_ids"]}
+    if role.id in role_ids:
+        await interaction.response.send_message(
+            f"{role.mention} is already exempt.", ephemeral=True
+        )
+        return
+
+    role_ids.add(role.id)
+    guild_state["exempt_role_ids"] = sorted(role_ids)
+    save_state(state)
+
+    note = ""
+    if guild_state["active"]:
+        await apply_lock_to_guild(interaction.guild)
+        note = " The active maintenance lock has been updated."
+    await interaction.response.send_message(
+        f"Added {role.mention} to the exempt roles.{note}", ephemeral=True
+    )
+
+
+@exempt_group.command(name="remove", description="Remove a role's maintenance exemption.")
+@app_commands.describe(role="The role to remove from the exempt list.")
+@app_commands.checks.has_permissions(administrator=True)
+async def exempt_remove(interaction: discord.Interaction, role: discord.Role):
+    guild_state = get_guild_state(interaction.guild)
+    role_ids = {int(role_id) for role_id in guild_state["exempt_role_ids"]}
+    if role.id not in role_ids:
+        await interaction.response.send_message(
+            f"{role.mention} is not currently exempt.", ephemeral=True
+        )
+        return
+
+    role_ids.remove(role.id)
+    guild_state["exempt_role_ids"] = sorted(role_ids)
+    save_state(state)
+
+    note = ""
+    if guild_state["active"]:
+        await apply_lock_to_guild(interaction.guild)
+        note = " The active maintenance lock has been updated."
+    await interaction.response.send_message(
+        f"Removed {role.mention} from the exempt roles.{note}", ephemeral=True
+    )
+
+
+@exempt_group.command(name="list", description="List roles exempt from maintenance.")
+@app_commands.checks.has_permissions(administrator=True)
+async def exempt_list(interaction: discord.Interaction):
+    guild_state = get_guild_state(interaction.guild)
+    roles = [
+        interaction.guild.get_role(int(role_id))
+        for role_id in guild_state["exempt_role_ids"]
+    ]
+    roles = [role for role in roles if role is not None]
+    if not roles:
+        message = "No exempt roles are configured for this server."
+    else:
+        message = "Exempt roles: " + ", ".join(role.mention for role in roles)
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+bot.tree.add_command(exempt_group)
 
 
 @bot.tree.error
