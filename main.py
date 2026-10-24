@@ -82,10 +82,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 state = load_state()
 
 
-def is_exempt(role):
-    return role.id in EXEMPT_ROLE_IDS
-
-
 async def lock_channel(channel):
     guild = channel.guild
     guild_state = state.setdefault(str(guild.id), {"active": False, "channels": {}})
@@ -102,14 +98,21 @@ async def lock_channel(channel):
     everyone_overwrite.view_channel = False
     overwrites[everyone] = everyone_overwrite
 
-    # Explicitly allow configured exempt roles to view the channel.
-    for role_id in EXEMPT_ROLE_IDS:
-        role = guild.get_role(role_id)
-        if role is None:
+    # Prevent ordinary role overwrites from bypassing the @everyone deny.
+    # Only configured exempt roles receive an explicit view permission.
+    for role in guild.roles:
+        if role == everyone:
             continue
         role_overwrite = overwrites.get(role, discord.PermissionOverwrite())
-        role_overwrite.view_channel = True
+        role_overwrite.view_channel = role.id in EXEMPT_ROLE_IDS
         overwrites[role] = role_overwrite
+
+    # Member-specific allows can override role-level denies, so neutralize
+    # those view overwrites during maintenance. Exempt roles still get access.
+    for target, member_overwrite in list(overwrites.items()):
+        if isinstance(target, discord.Member):
+            member_overwrite.view_channel = None
+            overwrites[target] = member_overwrite
 
     await channel.edit(overwrites=overwrites, reason="Clow: maintenance enabled")
 
